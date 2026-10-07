@@ -104,3 +104,15 @@ async def cancel_booking(booking_id: int, user_id: int | None = None) -> aiosqli
             await db.execute("UPDATE bookings SET status = 'cancelled' WHERE id = ?", (booking_id,))
             await db.commit()
         return row
+
+
+async def count_future(column: str, value: str) -> int:
+    """Сколько предстоящих записей у услуги (column='service') или мастера (column='master')."""
+    if column not in {"service", "master"}:
+        raise ValueError(column)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            f"SELECT COUNT(*) FROM bookings WHERE {column} = ? AND status = 'active' AND start_at >= ?",
+            (value, datetime.now().isoformat(timespec="minutes")),
+        )
+        return (await cur.fetchone())[0]

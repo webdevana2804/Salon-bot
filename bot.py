@@ -13,19 +13,17 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
-    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
-    KeyboardButton, Message, ReplyKeyboardMarkup,
+    BotCommand, BotCommandScopeChat, CallbackQuery, InlineKeyboardMarkup, KeyboardButton, Message,
+    ReplyKeyboardMarkup,
 )
 
+import admin
+import catalog
 import db
-from config import (
-    ADMIN_IDS, BOT_TOKEN, DAYS_AHEAD, DAYS_OFF, MASTERS, SALON_ADDRESS, SALON_NAME,
-    SALON_PHONE, SERVICES, SLOT_STEP_MIN, WORK_END, WORK_START,
-)
+from common import WEEKDAYS, fmt_booking, fmt_days_off, fmt_hours, h, inline, notify_admins
+from config import ADMIN_IDS, BOT_TOKEN, DAYS_AHEAD, SLOT_STEP_MIN
 
 router = Router()
-
-WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 BTN_BOOK, BTN_MY, BTN_CONTACTS = "📅 Записаться", "📋 Мои записи", "📍 Контакты"
 
 
@@ -49,22 +47,16 @@ def main_menu() -> ReplyKeyboardMarkup:
     )
 
 
-def inline(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=t, callback_data=d) for t, d in row] for row in rows
-    ])
-
-
 CANCEL_ROW = [("✖️ Отмена", "abort")]
 
 
 def services_kb() -> InlineKeyboardMarkup:
-    rows = [[(f"{name} — {price} ₽", f"svc:{sid}")] for sid, (name, _, price) in SERVICES.items()]
+    rows = [[(f"{s.name} — {s.price} ₽", f"svc:{s.id}")] for s in catalog.bookable_services()]
     return inline(rows + [CANCEL_ROW])
 
 
 def masters_kb(service_id: str) -> InlineKeyboardMarkup:
-    rows = [[(name, f"mst:{mid}")] for mid, (name, skills) in MASTERS.items() if service_id in skills]
+    rows = [[(m.name, f"mst:{m.id}")] for m in catalog.masters_for(service_id)]
     return inline(rows + [[("⬅️ Назад", "back:service")], CANCEL_ROW])
 
 
@@ -73,7 +65,7 @@ def days_kb() -> InlineKeyboardMarkup:
     buttons = []
     for i in range(DAYS_AHEAD):
         d = today + timedelta(days=i)
-        if d.weekday() in DAYS_OFF:
+        if d.weekday() in catalog.days_off():
             continue
         buttons.append((f"{WEEKDAYS[d.weekday()]} {d:%d.%m}", f"day:{d.isoformat()}"))
     rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
@@ -89,11 +81,12 @@ def times_kb(slots: list[datetime]) -> InlineKeyboardMarkup:
 # ---------- логика слотов ----------
 
 async def free_slots(master: str, service: str, day: date) -> list[datetime]:
-    duration = timedelta(minutes=SERVICES[service][1])
+    duration = timedelta(minutes=catalog.services[service].duration)
     busy = await db.busy_intervals(master, day.isoformat())
     now = datetime.now()
-    t = datetime.combine(day, datetime.min.time()).replace(hour=WORK_START)
-    close = t.replace(hour=WORK_END)
+    work_start, work_end = catalog.work_hours()
+    t = datetime.combine(day, datetime.min.time()) + timedelta(hours=work_start)
+    close = t + timedelta(hours=work_end - work_start)
     slots = []
     while t + duration <= close:
         if t > now and all(not (t < e and t + duration > s) for s, e in busy):
@@ -102,39 +95,24 @@ async def free_slots(master: str, service: str, day: date) -> list[datetime]:
     return slots
 
 
-def fmt_booking(row) -> str:
-    start = datetime.fromisoformat(row["start_at"])
-    return (f"<b>{SERVICES[row['service']][0]}</b>\n"
-            f"🗓 {WEEKDAYS[start.weekday()]} {start:%d.%m.%Y}, {start:%H:%M}\n"
-            f"👩 Мастер: {MASTERS[row['master']][0]}")
-
-
-async def notify_admins(bot: Bot, text: str) -> None:
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(admin_id, text)
-        except Exception as e:  # админ мог не запускать бота
-            logging.warning("Не удалось уведомить админа %s: %s", admin_id, e)
-
-
 # ---------- общие команды ----------
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer(
-        f"Здравствуйте! 👋 Я бот <b>{SALON_NAME}</b>.\n"
-        "Помогу записаться на процедуру, посмотреть или отменить запись.",
-        reply_markup=main_menu(),
-    )
+    text = catalog.settings["greeting"]
+    if message.from_user.id in ADMIN_IDS:
+        text += ("\n\n<i>Вы администратор:\n/admin — записи на неделю\n"
+                 "/settings — услуги, мастера, тексты и график</i>")
+    await message.answer(text, reply_markup=main_menu())
 
 
 @router.message(F.text == BTN_CONTACTS)
 async def contacts(message: Message):
+    s = catalog.settings
     await message.answer(
-        f"<b>{SALON_NAME}</b>\n📍 {SALON_ADDRESS}\n📞 {SALON_PHONE}\n"
-        f"🕙 Ежедневно {WORK_START}:00–{WORK_END}:00"
-        + (", кроме воскресенья" if 6 in DAYS_OFF else "")
+        f"<b>{h(s['salon_name'])}</b>\n📍 {h(s['address'])}\n📞 {h(s['phone'])}\n"
+        f"🕙 Часы работы: {fmt_hours()}\n📅 Выходные: {fmt_days_off()}"
     )
 
 
@@ -150,6 +128,9 @@ async def abort(call: CallbackQuery, state: FSMContext):
 @router.message(Command("book"))
 async def start_booking(message: Message, state: FSMContext):
     await state.clear()
+    if not catalog.bookable_services():
+        await message.answer("Сейчас запись недоступна. Позвоните нам: " + h(catalog.settings["phone"]))
+        return
     await state.set_state(Booking.service)
     await message.answer("Выберите услугу:", reply_markup=services_kb())
 
@@ -157,11 +138,15 @@ async def start_booking(message: Message, state: FSMContext):
 @router.callback_query(Booking.service, F.data.startswith("svc:"))
 async def choose_service(call: CallbackQuery, state: FSMContext):
     service = call.data.split(":", 1)[1]
+    if not catalog.masters_for(service):
+        await call.answer("Эта услуга сейчас недоступна", show_alert=True)
+        await call.message.edit_text("Выберите услугу:", reply_markup=services_kb())
+        return
     await state.update_data(service=service)
     await state.set_state(Booking.master)
-    name, minutes, price = SERVICES[service]
+    svc = catalog.services[service]
     await call.message.edit_text(
-        f"Услуга: <b>{name}</b> ({minutes} мин, {price} ₽)\n\nВыберите мастера:",
+        f"Услуга: <b>{h(svc.name)}</b> ({svc.duration} мин, {svc.price} ₽)\n\nВыберите мастера:",
         reply_markup=masters_kb(service),
     )
 
@@ -241,15 +226,15 @@ async def enter_phone(message: Message, state: FSMContext):
     await state.update_data(phone=phone)
     await state.set_state(Booking.confirm)
     data = await state.get_data()
-    name, minutes, price = SERVICES[data["service"]]
+    svc = catalog.services[data["service"]]
     day = date.fromisoformat(data["day"])
     await message.answer("Почти готово!", reply_markup=main_menu())
     await message.answer(
         "Проверьте данные записи:\n\n"
-        f"💅 Услуга: <b>{name}</b> ({minutes} мин)\n"
-        f"👩 Мастер: {MASTERS[data['master']][0]}\n"
+        f"💅 Услуга: <b>{h(svc.name)}</b> ({svc.duration} мин)\n"
+        f"👩 Мастер: {h(catalog.master_name(data['master']))}\n"
         f"🗓 {WEEKDAYS[day.weekday()]} {day:%d.%m.%Y}, {data['time']}\n"
-        f"💰 Стоимость: {price} ₽\n"
+        f"💰 Стоимость: {svc.price} ₽\n"
         f"🙋 {data['name']}, {phone}",
         reply_markup=inline([[("✅ Подтвердить", "confirm")], CANCEL_ROW]),
     )
@@ -259,7 +244,7 @@ async def enter_phone(message: Message, state: FSMContext):
 async def confirm(call: CallbackQuery, state: FSMContext, bot: Bot):
     data = await state.get_data()
     start = datetime.fromisoformat(f"{data['day']}T{data['time']}")
-    end = start + timedelta(minutes=SERVICES[data["service"]][1])
+    end = start + timedelta(minutes=catalog.services[data["service"]].duration)
     booking_id = await db.create_booking(
         call.from_user.id, data["name"], data["phone"], data["service"], data["master"], start, end,
     )
@@ -271,12 +256,12 @@ async def confirm(call: CallbackQuery, state: FSMContext, bot: Bot):
     await state.clear()
     await call.message.edit_text(
         f"🎉 Вы записаны! Номер записи: <b>#{booking_id}</b>\n\n"
-        f"Ждём вас по адресу: {SALON_ADDRESS}\n"
+        f"Ждём вас по адресу: {h(catalog.settings['address'])}\n"
         f"Посмотреть или отменить запись можно в разделе «{BTN_MY}»."
     )
     await notify_admins(bot, (
         f"🆕 Новая запись #{booking_id}\n"
-        f"{SERVICES[data['service']][0]} — {MASTERS[data['master']][0]}\n"
+        f"{h(catalog.service_name(data['service']))} — {h(catalog.master_name(data['master']))}\n"
         f"🗓 {start:%d.%m.%Y %H:%M}\n🙋 {data['name']}, {data['phone']}"
     ))
 
@@ -308,49 +293,6 @@ async def user_cancel(call: CallbackQuery, bot: Bot):
                              f"🙋 {row['client_name']}, {row['phone']}")
 
 
-# ---------- администратор ----------
-
-@router.message(Command("admin"), F.from_user.id.in_(ADMIN_IDS))
-async def admin_schedule(message: Message):
-    """Все предстоящие записи на DAYS_AHEAD дней вперёд, сгруппированные по дням."""
-    now = datetime.now()
-    until = datetime.combine(date.today() + timedelta(days=DAYS_AHEAD), datetime.min.time())
-    rows = await db.bookings_between(now, until)
-    if not rows:
-        await message.answer(f"На ближайшие {DAYS_AHEAD} дней записей нет.")
-        return
-    by_day: dict[date, list] = {}
-    for row in rows:
-        by_day.setdefault(datetime.fromisoformat(row["start_at"]).date(), []).append(row)
-    await message.answer(f"📋 Записи на {DAYS_AHEAD} дней вперёд: всего {len(rows)}")
-    for day, day_rows in by_day.items():
-        await message.answer(f"━━━━━━━━━━━━━━\n🗓 <b>{WEEKDAYS[day.weekday()]} {day:%d.%m}</b> — "
-                             f"записей: {len(day_rows)}")
-        for row in day_rows:
-            start = datetime.fromisoformat(row["start_at"])
-            await message.answer(
-                f"<b>{start:%H:%M}</b> · {SERVICES[row['service']][0]} (#{row['id']})\n"
-                f"👩 Мастер: {MASTERS[row['master']][0]}\n"
-                f"🙋 {row['client_name']}, {row['phone']}",
-                reply_markup=inline([[("❌ Отменить", f"acancel:{row['id']}")]]),
-            )
-
-
-@router.callback_query(F.data.startswith("acancel:"), F.from_user.id.in_(ADMIN_IDS))
-async def admin_cancel(call: CallbackQuery, bot: Bot):
-    row = await db.cancel_booking(int(call.data.split(":", 1)[1]))
-    if not row:
-        await call.answer("Запись уже отменена", show_alert=True)
-        return
-    await call.message.edit_text(f"Запись #{row['id']} отменена администратором.")
-    try:
-        await bot.send_message(row["user_id"], "К сожалению, ваша запись отменена салоном. "
-                                               f"Приносим извинения!\n\n{fmt_booking(row)}\n\n"
-                                               f"Связаться с нами: {SALON_PHONE}")
-    except Exception as e:
-        logging.warning("Не удалось уведомить клиента: %s", e)
-
-
 @router.callback_query()
 async def stale_callback(call: CallbackQuery):
     """Нажатие на кнопку из устаревшего сообщения."""
@@ -367,6 +309,22 @@ async def auto_answer_callback(handler, event: CallbackQuery, data):
     return result
 
 
+async def set_commands(bot: Bot) -> None:
+    """Меню команд в Telegram: клиентам — базовые, администраторам — ещё и админские."""
+    base = [BotCommand(command="start", description="Главное меню"),
+            BotCommand(command="book", description="Записаться"),
+            BotCommand(command="my", description="Мои записи")]
+    await bot.set_my_commands(base)
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.set_my_commands(base + [
+                BotCommand(command="admin", description="Записи на неделю"),
+                BotCommand(command="settings", description="Настройки салона"),
+            ], scope=BotCommandScopeChat(chat_id=admin_id))
+        except Exception as e:  # админ ещё не открывал бота
+            logging.warning("Не удалось задать меню команд админу %s: %s", admin_id, e)
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     if not BOT_TOKEN:
@@ -375,8 +333,11 @@ async def main() -> None:
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher()
     dp.callback_query.middleware(auto_answer_callback)
+    dp.include_router(admin.router)  # раньше клиентского: там есть «ловушка» устаревших кнопок
     dp.include_router(router)
     await db.init_db()
+    await catalog.init()
+    await set_commands(bot)
     await dp.start_polling(bot)
 
 
