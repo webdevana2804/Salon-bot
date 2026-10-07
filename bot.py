@@ -312,17 +312,28 @@ async def user_cancel(call: CallbackQuery, bot: Bot):
 
 @router.message(Command("admin"), F.from_user.id.in_(ADMIN_IDS))
 async def admin_schedule(message: Message):
-    """Расписание на сегодня и завтра."""
-    today = datetime.combine(date.today(), datetime.min.time())
-    rows = await db.bookings_between(today, today + timedelta(days=2))
+    """Все предстоящие записи на DAYS_AHEAD дней вперёд, сгруппированные по дням."""
+    now = datetime.now()
+    until = datetime.combine(date.today() + timedelta(days=DAYS_AHEAD), datetime.min.time())
+    rows = await db.bookings_between(now, until)
     if not rows:
-        await message.answer("На сегодня и завтра записей нет.")
+        await message.answer(f"На ближайшие {DAYS_AHEAD} дней записей нет.")
         return
+    by_day: dict[date, list] = {}
     for row in rows:
-        await message.answer(
-            f"#{row['id']} {fmt_booking(row)}\n🙋 {row['client_name']}, {row['phone']}",
-            reply_markup=inline([[("❌ Отменить", f"acancel:{row['id']}")]]),
-        )
+        by_day.setdefault(datetime.fromisoformat(row["start_at"]).date(), []).append(row)
+    await message.answer(f"📋 Записи на {DAYS_AHEAD} дней вперёд: всего {len(rows)}")
+    for day, day_rows in by_day.items():
+        await message.answer(f"━━━━━━━━━━━━━━\n🗓 <b>{WEEKDAYS[day.weekday()]} {day:%d.%m}</b> — "
+                             f"записей: {len(day_rows)}")
+        for row in day_rows:
+            start = datetime.fromisoformat(row["start_at"])
+            await message.answer(
+                f"<b>{start:%H:%M}</b> · {SERVICES[row['service']][0]} (#{row['id']})\n"
+                f"👩 Мастер: {MASTERS[row['master']][0]}\n"
+                f"🙋 {row['client_name']}, {row['phone']}",
+                reply_markup=inline([[("❌ Отменить", f"acancel:{row['id']}")]]),
+            )
 
 
 @router.callback_query(F.data.startswith("acancel:"), F.from_user.id.in_(ADMIN_IDS))
