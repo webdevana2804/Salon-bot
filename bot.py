@@ -1,4 +1,6 @@
 """Telegram-бот для записи на процедуры в салон красоты (aiogram 3)."""
+from __future__ import annotations
+
 import asyncio
 import html
 import logging
