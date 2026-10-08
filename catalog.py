@@ -30,6 +30,10 @@ CREATE TABLE IF NOT EXISTS masters (
     name   TEXT    NOT NULL,
     active INTEGER NOT NULL DEFAULT 1
 );
+CREATE TABLE IF NOT EXISTS admins (  -- дополнительные админы, добавленные через /settings
+    user_id INTEGER PRIMARY KEY,
+    name    TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS master_services (
     master_id  TEXT NOT NULL,
     service_id TEXT NOT NULL,
@@ -69,6 +73,7 @@ DEFAULT_SETTINGS = {
 settings: dict[str, str] = {}
 services: dict[str, Service] = {}  # включая удалённые — нужны для старых записей
 masters: dict[str, Master] = {}
+extra_admins: dict[int, str] = {}  # user_id -> имя; главные админы — в config.ADMIN_IDS (.env)
 
 
 # ---------- загрузка ----------
@@ -110,6 +115,9 @@ async def reload() -> None:
         for mid, sid in await db.execute_fetchall("SELECT master_id, service_id FROM master_services"):
             if mid in masters:
                 masters[mid].services.add(sid)
+        extra_admins.clear()
+        extra_admins.update({uid: name for uid, name in await db.execute_fetchall(
+            "SELECT user_id, name FROM admins ORDER BY rowid")})
 
 
 async def _write(sql: str, params: tuple = ()) -> None:
@@ -119,6 +127,19 @@ async def _write(sql: str, params: tuple = ()) -> None:
 
 
 # ---------- чтение ----------
+
+def is_owner(user_id: int) -> bool:
+    """Главный админ (из .env): может назначать и снимать других админов."""
+    return user_id in config.ADMIN_IDS
+
+
+def is_admin(user_id: int) -> bool:
+    return is_owner(user_id) or user_id in extra_admins
+
+
+def admin_ids() -> set[int]:
+    return set(config.ADMIN_IDS) | set(extra_admins)
+
 
 def work_hours() -> tuple[int, int]:
     return int(settings["work_start"]), int(settings["work_end"])
@@ -192,6 +213,16 @@ async def rename_master(mid: str, name: str) -> None:
 async def delete_master(mid: str) -> None:
     await _write("UPDATE masters SET active = 0 WHERE id = ?", (mid,))
     await _write("DELETE FROM master_services WHERE master_id = ?", (mid,))
+    await reload()
+
+
+async def add_admin(user_id: int, name: str) -> None:
+    await _write("INSERT OR REPLACE INTO admins (user_id, name) VALUES (?, ?)", (user_id, name))
+    await reload()
+
+
+async def remove_admin(user_id: int) -> None:
+    await _write("DELETE FROM admins WHERE user_id = ?", (user_id,))
     await reload()
 
 

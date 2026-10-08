@@ -12,14 +12,15 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
 import catalog
+import config
 import db
-from common import WEEKDAYS, fmt_booking, fmt_days_off, fmt_hours, h, inline
-from config import ADMIN_IDS, DAYS_AHEAD
+from common import WEEKDAYS, fmt_booking, fmt_days_off, fmt_hours, h, inline, set_admin_menu
+from config import DAYS_AHEAD
 
 router = Router()
-# Все хендлеры этого роутера доступны только администраторам.
-router.message.filter(F.from_user.id.in_(ADMIN_IDS))
-router.callback_query.filter(F.from_user.id.in_(ADMIN_IDS))
+# Все хендлеры этого роутера доступны только администраторам (список меняется на лету).
+router.message.filter(lambda event: catalog.is_admin(event.from_user.id))
+router.callback_query.filter(lambda event: catalog.is_admin(event.from_user.id))
 
 
 class AdminInput(StatesGroup):
@@ -74,7 +75,7 @@ async def admin_cancel(call: CallbackQuery, bot: Bot):
 
 # ---------- экраны настроек ----------
 
-def menu_screen():
+def menu_screen(user_id: int):
     s = catalog.settings
     text = ("⚙️ <b>Настройки салона</b>\n\n"
             f"🏠 Название: {h(s['salon_name'])}\n"
@@ -90,9 +91,21 @@ def menu_screen():
         [("📞 Телефон", "st:ask:phone"), ("🕙 Часы работы", "st:ask:hours")],
         [("📅 Выходные дни", "st:days")],
         [("💅 Услуги", "st:svcs"), ("👩 Мастера", "st:msts")],
+        *([[("👑 Администраторы", "st:adm")]] if catalog.is_owner(user_id) else []),
         [("✖️ Закрыть", "st:close")],
     ])
     return text, kb
+
+
+def admins_screen():
+    lines = [f"👑 {uid} — главный (из файла .env)" for uid in sorted(config.ADMIN_IDS)]
+    lines += [f"👤 {h(name) + ' · ' if name else ''}ID {uid}" for uid, name in catalog.extra_admins.items()]
+    text = ("👑 <b>Администраторы</b>\n\n" + "\n".join(lines) + "\n\n"
+            "Администраторы видят все записи, получают уведомления и меняют настройки. "
+            "Назначать и снимать админов могут только главные.")
+    rows = [[(f"🗑 Снять: {name or f'ID {uid}'}", f"st:admdel:{uid}")]
+            for uid, name in catalog.extra_admins.items()]
+    return text, inline(rows + [[("➕ Добавить администратора", "st:admadd")], [BACK_MENU]])
 
 
 def days_screen():
@@ -173,14 +186,14 @@ async def show(call: CallbackQuery, screen) -> None:
 @router.message(Command("settings"))
 async def cmd_settings(message: Message, state: FSMContext):
     await state.clear()
-    text, kb = menu_screen()
+    text, kb = menu_screen(message.from_user.id)
     await message.answer(text, reply_markup=kb)
 
 
 @router.callback_query(F.data == "st:menu")
 async def st_menu(call: CallbackQuery, state: FSMContext):
     await state.clear()
-    await show(call, menu_screen())
+    await show(call, menu_screen(call.from_user.id))
 
 
 @router.callback_query(F.data == "st:close")
@@ -284,6 +297,91 @@ async def st_master_delete(call: CallbackQuery):
     await show(call, masters_screen())
 
 
+# ---------- администраторы (только для главных) ----------
+
+ADD_ADMIN_HELP = (
+    "➕ <b>Новый администратор</b>\n\n"
+    "Отправьте его Telegram ID — число, которое человек может узнать у @userinfobot.\n"
+    "Или отправьте его контакт: 📎 → Контакт (если он есть у вас в телефоне и в Telegram).\n\n"
+    "Важно: человек должен сам открыть этого бота и нажать Start — иначе бот не сможет ему писать."
+)
+
+
+@router.callback_query(F.data == "st:adm")
+async def st_admins(call: CallbackQuery, state: FSMContext):
+    if not catalog.is_owner(call.from_user.id):
+        await call.answer("Это могут только главные администраторы", show_alert=True)
+        return
+    await state.clear()
+    await show(call, admins_screen())
+
+
+@router.callback_query(F.data == "st:admadd")
+async def st_admin_add(call: CallbackQuery, state: FSMContext):
+    if not catalog.is_owner(call.from_user.id):
+        await call.answer("Это могут только главные администраторы", show_alert=True)
+        return
+    await state.set_state(AdminInput.value)
+    await state.update_data(what="new_admin")
+    await call.message.edit_text(ADD_ADMIN_HELP + CANCEL_HINT)
+
+
+@router.callback_query(F.data.startswith("st:admdel:"))
+async def st_admin_delete_ask(call: CallbackQuery):
+    uid = int(call.data.split(":")[2])
+    if not catalog.is_owner(call.from_user.id) or uid not in catalog.extra_admins:
+        await call.answer("Недоступно", show_alert=True)
+        return
+    await call.message.edit_text(
+        f"Снять права администратора с «{h(catalog.extra_admins[uid] or f'ID {uid}')}»?\n"
+        "Этот человек перестанет видеть записи и настройки, но сможет записываться как клиент.",
+        reply_markup=inline([[("🗑 Да, снять", f"st:admdel!:{uid}"), ("Отмена", "st:adm")]]),
+    )
+
+
+@router.callback_query(F.data.startswith("st:admdel!:"))
+async def st_admin_delete(call: CallbackQuery, bot: Bot):
+    uid = int(call.data.split(":")[2])
+    if not catalog.is_owner(call.from_user.id):
+        await call.answer("Недоступно", show_alert=True)
+        return
+    await catalog.remove_admin(uid)
+    await set_admin_menu(bot, uid, is_admin=False)
+    await call.answer("Права администратора сняты")
+    await show(call, admins_screen())
+
+
+async def add_admin_from(message: Message, bot: Bot) -> str | None:
+    """Добавляет админа по ID из текста или по контакту. Возвращает ошибку или None."""
+    if message.contact:
+        if not message.contact.user_id:
+            return "У этого контакта нет Telegram. Отправьте ID числом (его можно узнать у @userinfobot)."
+        uid = message.contact.user_id
+        name = " ".join(filter(None, [message.contact.first_name, message.contact.last_name]))
+    else:
+        text = (message.text or "").strip()
+        if not text.isdigit() or not 5 <= len(text) <= 15:
+            return "Отправьте Telegram ID числом, например <code>987654321</code>, или контакт человека."
+        uid, name = int(text), ""
+    if catalog.is_admin(uid):
+        return "Этот человек уже администратор."
+    reachable = True
+    try:
+        chat = await bot.get_chat(uid)
+        name = name or " ".join(filter(None, [chat.first_name, chat.last_name])) or chat.username or ""
+    except Exception:
+        reachable = False  # человек ещё не нажимал Start в боте
+    await catalog.add_admin(uid, name)
+    await set_admin_menu(bot, uid)
+    if reachable:
+        try:
+            await bot.send_message(uid, "👑 Вас назначили администратором салона в этом боте.\n\n"
+                                        "/admin — записи на неделю\n/settings — услуги, мастера, тексты и график")
+        except Exception:
+            reachable = False
+    return None if reachable else "not_reachable"
+
+
 # ---------- ввод текста ----------
 
 PROMPTS = {
@@ -348,7 +446,7 @@ async def st_ask_new_master(call: CallbackQuery, state: FSMContext):
 @router.message(AdminInput.value, Command("cancel"))
 async def input_cancel(message: Message, state: FSMContext):
     await state.clear()
-    text, kb = menu_screen()
+    text, kb = menu_screen(message.from_user.id)
     await message.answer("Изменение отменено.\n\n" + text, reply_markup=kb)
 
 
@@ -359,10 +457,11 @@ def parse_int(text: str, low: int, high: int) -> int | None:
     return None
 
 
+@router.message(AdminInput.value, F.contact)
 @router.message(AdminInput.value, F.text)
-async def input_value(message: Message, state: FSMContext):
+async def input_value(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
-    what, text = data["what"], message.text.strip()
+    what, text = data["what"], (message.text or "").strip()
 
     async def reply(screen, note: str = "✅ Сохранено") -> None:
         await state.clear()
@@ -372,11 +471,27 @@ async def input_value(message: Message, state: FSMContext):
     async def retry(error: str) -> None:
         await message.answer(f"⚠️ {error}{CANCEL_HINT}")
 
+    if what == "new_admin":
+        if not catalog.is_owner(message.from_user.id):
+            await state.clear()
+            return
+        error = await add_admin_from(message, bot)
+        if error == "not_reachable":
+            return await reply(admins_screen(),
+                               "✅ Администратор добавлен.\n⚠️ Этот человек ещё не открывал бота. Попросите найти бота "
+                               "и нажать Start, иначе уведомления о записях до него не дойдут.")
+        if error:
+            return await retry(error)
+        return await reply(admins_screen(), "✅ Администратор добавлен, ему отправлено уведомление.")
+
+    if message.contact:
+        return await retry("Здесь нужен текст, а не контакт.")
+
     if what == "greeting":
         if len(text) > 1000:
             return await retry("Слишком длинный текст, уложитесь в 1000 символов.")
         await catalog.set_setting("greeting", message.html_text)
-        return await reply(menu_screen(), "✅ Приветствие обновлено. Проверьте: /start")
+        return await reply(menu_screen(message.from_user.id), "✅ Приветствие обновлено. Проверьте: /start")
 
     if what in {"salon_name", "address", "phone"}:
         if not 2 <= len(text) <= 200:
@@ -385,7 +500,7 @@ async def input_value(message: Message, state: FSMContext):
         note = "✅ Сохранено"
         if what == "salon_name":
             note += "\nЕсли название упоминается в приветствии, обновите и его: «📝 Приветствие»."
-        return await reply(menu_screen(), note)
+        return await reply(menu_screen(message.from_user.id), note)
 
     if what == "hours":
         m = re.fullmatch(r"(\d{1,2})(?::00)?\s*[-–—]\s*(\d{1,2})(?::00)?", text)
@@ -394,7 +509,7 @@ async def input_value(message: Message, state: FSMContext):
             return await retry("Не понял формат. Пример: <code>10-20</code> — с 10:00 до 20:00.")
         await catalog.set_setting("work_start", str(start))
         await catalog.set_setting("work_end", str(end))
-        return await reply(menu_screen())
+        return await reply(menu_screen(message.from_user.id))
 
     if what in {"svc_name", "new_svc_name", "master_name", "new_master"}:
         if not 2 <= len(text) <= 60:

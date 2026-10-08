@@ -12,16 +12,16 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    BotCommand, BotCommandScopeChat, CallbackQuery, InlineKeyboardMarkup, KeyboardButton, Message,
-    ReplyKeyboardMarkup,
-)
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
 
 import admin
 import catalog
 import db
-from common import WEEKDAYS, fmt_booking, fmt_days_off, fmt_hours, h, inline, notify_admins
-from config import ADMIN_IDS, BOT_TOKEN, DAYS_AHEAD, SLOT_STEP_MIN
+from common import (
+    CLIENT_COMMANDS, WEEKDAYS, fmt_booking, fmt_days_off, fmt_hours, h, inline, notify_admins,
+    set_admin_menu,
+)
+from config import BOT_TOKEN, DAYS_AHEAD, SLOT_STEP_MIN
 
 router = Router()
 BTN_BOOK, BTN_MY, BTN_CONTACTS = "📅 Записаться", "📋 Мои записи", "📍 Контакты"
@@ -101,7 +101,11 @@ async def free_slots(master: str, service: str, day: date) -> list[datetime]:
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     text = catalog.settings["greeting"]
-    if message.from_user.id in ADMIN_IDS:
+    user = message.from_user
+    if user.id in catalog.extra_admins and not catalog.extra_admins[user.id]:
+        # админа добавили по ID до того, как он открыл бота, — запоминаем имя
+        await catalog.add_admin(user.id, user.full_name)
+    if catalog.is_admin(user.id):
         text += ("\n\n<i>Вы администратор:\n/admin — записи на неделю\n"
                  "/settings — услуги, мастера, тексты и график</i>")
     await message.answer(text, reply_markup=main_menu())
@@ -311,18 +315,9 @@ async def auto_answer_callback(handler, event: CallbackQuery, data):
 
 async def set_commands(bot: Bot) -> None:
     """Меню команд в Telegram: клиентам — базовые, администраторам — ещё и админские."""
-    base = [BotCommand(command="start", description="Главное меню"),
-            BotCommand(command="book", description="Записаться"),
-            BotCommand(command="my", description="Мои записи")]
-    await bot.set_my_commands(base)
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.set_my_commands(base + [
-                BotCommand(command="admin", description="Записи на неделю"),
-                BotCommand(command="settings", description="Настройки салона"),
-            ], scope=BotCommandScopeChat(chat_id=admin_id))
-        except Exception as e:  # админ ещё не открывал бота
-            logging.warning("Не удалось задать меню команд админу %s: %s", admin_id, e)
+    await bot.set_my_commands(CLIENT_COMMANDS)
+    for admin_id in catalog.admin_ids():
+        await set_admin_menu(bot, admin_id)
 
 
 async def main() -> None:
